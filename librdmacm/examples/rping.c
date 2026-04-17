@@ -45,6 +45,7 @@
 #include <semaphore.h>
 #include <pthread.h>
 #include <inttypes.h>
+#include <sys/time.h>
 #include <rdma/rdma_cma.h>
 #include "common.h"
 
@@ -864,7 +865,12 @@ static int rping_bind_server(struct rping_cb *cb)
 	}
 	DEBUG_LOG("rdma_bind_addr successful\n");
 
-	DEBUG_LOG("rdma_listen\n");
+	{
+		char addr_str[INET6_ADDRSTRLEN];
+		getnameinfo((struct sockaddr *)&cb->sin, sizeof(cb->sin),
+			    addr_str, sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
+		DEBUG_LOG("rdma_listen on %s:%d\n", addr_str, ntohs(cb->port));
+	}
 	ret = rdma_listen(cb->cm_id, 3);
 	if (ret) {
 		perror("rdma_listen");
@@ -1064,10 +1070,17 @@ static int rping_test_client(struct rping_cb *cb)
 	int ping, start, cc, i, ret = 0;
 	struct ibv_send_wr *bad_wr;
 	unsigned char c;
+	struct timeval tv_start, tv_end, tv_total_start, tv_total_end;
+	double elapsed_ms;
+	double rtt_min = 0, rtt_max = 0, rtt_sum = 0;
+	int packets_sent = 0, packets_received = 0;
+	double total_time_ms;
 
 	start = 65;
+	gettimeofday(&tv_total_start, NULL);
 	for (ping = 0; !cb->count || ping < cb->count; ping++) {
 		cb->state = RDMA_READ_ADV;
+		packets_sent++;
 
 		/* Put some ascii text in the buffer. */
 		cc = snprintf(cb->start_buf, cb->size, RPING_MSG_FMT, ping);
@@ -1081,6 +1094,8 @@ static int rping_test_client(struct rping_cb *cb)
 		if (start > 122)
 			start = 65;
 		cb->start_buf[cb->size - 1] = 0;
+		
+		gettimeofday(&tv_start, NULL);
 
 		rping_format_send(cb, cb->start_buf, cb->start_mr);
 		ret = ibv_post_send(cb->qp, &cb->sq_wr, &bad_wr);
@@ -1123,7 +1138,39 @@ static int rping_test_client(struct rping_cb *cb)
 
 		if (cb->verbose)
 			printf("ping data: %s\n", cb->rdma_buf);
+
+		gettimeofday(&tv_end, NULL);
+		elapsed_ms = (tv_end.tv_sec - tv_start.tv_sec) * 1000.0 +
+			     (tv_end.tv_usec - tv_start.tv_usec) / 1000.0;
+		{
+			char addr_str[INET6_ADDRSTRLEN];
+			getnameinfo((struct sockaddr *)&cb->sin, sizeof(cb->sin),
+				    addr_str, sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
+			printf("rdma-ping-%d: %s request took %.3f ms\n", ping, addr_str, elapsed_ms);
+		}
+
+		packets_received++;
+		if (packets_received == 1) {
+			rtt_min = elapsed_ms;
+			rtt_max = elapsed_ms;
+		} else {
+			if (elapsed_ms < rtt_min) rtt_min = elapsed_ms;
+			if (elapsed_ms > rtt_max) rtt_max = elapsed_ms;
+		}
+		rtt_sum += elapsed_ms;
 	}
+
+	gettimeofday(&tv_total_end, NULL);
+	total_time_ms = (tv_total_end.tv_sec - tv_total_start.tv_sec) * 1000.0 +
+			(tv_total_end.tv_usec - tv_total_start.tv_usec) / 1000.0;
+	printf("\n--- rping statistics ---\n");
+	printf("%d packets transmitted, %d received, %d%% packet loss, time %.0f ms\n",
+	       packets_sent, packets_received,
+	       packets_sent > 0 ? ((packets_sent - packets_received) * 100 / packets_sent) : 0,
+	       total_time_ms);
+	if (packets_received > 0)
+		printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
+		       rtt_min, rtt_sum / packets_received, rtt_max);
 
 	return (cb->state == DISCONNECTED) ? 0 : ret;
 }
